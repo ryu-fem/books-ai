@@ -13,6 +13,7 @@ from telegram.ext import (
 )
 
 import database as db
+from ai_matcher import ai_pick_book, AIMatchUnavailable
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -23,20 +24,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_التوكن_هنا")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # ايدي التليجرام بتاعك
 
-# الجمل اللي لو ظهرت في رسالة حد في الجروب، البوت هيدور على اسم كتاب بعدها
-TRIGGER_PHRASES = [
-    "عايز",
-    "عاوز",
-    "عايزة",
-    "محتاج",
-    "ابحث عن",
-    "دور على",
-    "ممكن كتاب",
-    "فين كتاب",
-    "عندك كتاب",
-]
+# أقل عدد أحرف في الرسالة عشان تتفحص أصلاً (تقليل الضوضاء من رسائل زي "تمام"، "ok"..)
+MIN_MESSAGE_LENGTH = 4
 
-MATCH_THRESHOLD = 62  # نسبة التشابه المطلوبة عشان يبعت الكتاب (من 0 لـ100)
+MATCH_THRESHOLD = 62  # نسبة التشابه المطلوبة في المطابقة الاحتياطية (rapidfuzz) لو الموديل فشل يشتغل
 
 
 def is_owner(user_id: int) -> bool:
@@ -127,23 +118,12 @@ async def delete_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً! أنا بوت مكتبة. لو انت المالك ابعتلي كتاب في الخاص مع اسمه في الكابشن.\n"
-        "وأي حد في الجروب يقول 'عايز كذا' وهدوّر على أقرب كتاب واببعتهوله تلقائي."
+        "وأي حد في الجروب يتكلم عن كتاب من الكتب المتضافة (بأي صياغة)، "
+        "هبعتهوله تلقائي لو لقيت تطابق كويس."
     )
 
 
-# ---------- المطابقة الذكية في الجروب ----------
-
-def extract_query(text: str):
-    """يدور على جملة الطلب ويطلع اسم الكتاب المحتمل بعدها."""
-    lowered = text.strip()
-    for phrase in TRIGGER_PHRASES:
-        idx = lowered.find(phrase)
-        if idx != -1:
-            after = lowered[idx + len(phrase):].strip(" :.,؟!")
-            if after:
-                return after
-    return None
-
+# ---------- المطابقة الذكية في الجروب (بدون كلمة تريجر ثابتة) ----------
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -152,25 +132,37 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    query = extract_query(message.text)
-    if not query:
+    text = message.text.strip()
+    if len(text) < MIN_MESSAGE_LENGTH:
         return
 
     books = db.get_all_books()
     if not books:
         return
 
-    titles = [b[1] for b in books]
-    result = process.extractOne(query, titles, scorer=fuzz.WRatio)
-    if not result:
+    # بنستخدم Groq API (مجاني بالكامل) عشان يفهم أي رسالة بمعناها ويقارنها
+    # بعناوين الكتب، بما في ذلك الاختصارات وأجزاء الاسم، من غير ما يحتاج
+    # كلمة تريجر ثابتة زي "عايز". لو الـ AI شغال ورد بس مالقاش تطابق، ده رد
+    # شرعي وبنسيبه كده (مايردش خالص). لو الـ AI فشل يشتغل أصلاً (مفتاح
+    # مفقود، مشكلة نت..)، بننزل على مطابقة نصية احتياطية (rapidfuzz).
+    matched_book = None
+    try:
+        book_id = ai_pick_book(text, books)
+        if book_id is not None:
+            matched_book = next((b for b in books if b[0] == book_id), None)
+    except AIMatchUnavailable:
+        titles = [b[1] for b in books]
+        result = process.extractOne(text, titles, scorer=fuzz.WRatio)
+        if result:
+            _, score, idx = result
+            if score >= MATCH_THRESHOLD:
+                matched_book = books[idx]
+
+    # لو مفيش تطابق منطقي، البوت ببساطة مايردش خالص - ده السلوك الطبيعي.
+    if matched_book is None:
         return
 
-    matched_title, score, idx = result
-    if score < MATCH_THRESHOLD:
-        return
-
-    book = books[idx]
-    book_id, title, file_id, file_name = book
+    book_id, title, file_id, file_name = matched_book
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=file_id,

@@ -41,6 +41,10 @@ def ai_pick_book(query: str, books: list):
         "- كتب جزء بس من الاسم\n"
         "- وصف موضوع الكتاب بمعناه من غير ما يقول اسمه بالظبط\n"
         "- غلط إملائيًا أو كتب بالعامية المصرية\n\n"
+        "مهم جدًا: لازم يكون فيه تطابق حقيقي في الموضوع أو المادة الدراسية "
+        "أو الاسم. لو المستخدم طالب مادة أو موضوع مختلف تمامًا عن كل "
+        "الكتب المتاحة (مثلاً طالب كتاب رياضة/جيم ومفيش غير كتب برمجة "
+        "متاحة)، رد بالرقم 0. متخترعش تطابق مش موجود فعلاً.\n\n"
         f'رسالة المستخدم: "{query}"\n\n'
         f"قائمة الكتب المتاحة (رقم. العنوان):\n{listing}\n\n"
         "رد برقم الكتاب المطابق فقط، رقم واحد بدون أي كلام إضافي. لو مفيش "
@@ -74,4 +78,6 @@ def ai_pick_book(query: str, books: list):
         return None
     book_id = int(match.group())
     valid_ids = {b[0] for b in books}
-    return book_id if book_id in valid_ids else None
+    result = book_id if book_id in valid_ids else None
+    print(f"[ai_matcher] query={query!r} raw_response={text!r} -> book_id={result}")
+    return result

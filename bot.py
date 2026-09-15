@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 import database as db
-from grading import detect_grade
+from grading import detect_grade, detect_query_grade, grade_matches
 from ai_matcher import ai_pick_books, AIMatchUnavailable
 
 logging.basicConfig(
@@ -176,6 +176,17 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not books:
         return
 
+    # فلترة أولى بالمرحلة الدراسية (لو واضحة في رسالة المستخدم) قبل ما
+    # نبعت أي حاجة للـ AI أصلاً - ده بيمنع تمامًا إن الموديل يرجع كتاب من
+    # مرحلة مختلفة عن اللي المستخدم طلبها.
+    query_grade = detect_query_grade(text)
+    candidate_books = [b for b in books if grade_matches(detect_grade(b[1]), query_grade)]
+
+    # لو المستخدم حدد مرحلة واضحة ومفيش أي كتاب من المرحلة دي أصلاً، مفيش
+    # داعي نكلم الـ AI خالص.
+    if query_grade is not None and not candidate_books:
+        return
+
     # بنستخدم Groq API (مجاني بالكامل) عشان يحدد كل الكتب المطابقة بشرط إن
     # المرحلة الدراسية والمادة الاتنين يتطابقوا مع الطلب. لو الشرط اتحقق،
     # بيرجع كل الكتب المطابقة (كل الأجزاء)، مش كتاب واحد بس. لو الـ AI شغال
@@ -184,15 +195,15 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     # احتياطية (rapidfuzz) بترجع أقرب كتاب واحد بس.
     matched_books = []
     try:
-        book_ids = ai_pick_books(text, books)
-        matched_books = [b for b in books if b[0] in book_ids]
+        book_ids = ai_pick_books(text, candidate_books)
+        matched_books = [b for b in candidate_books if b[0] in book_ids]
     except AIMatchUnavailable:
-        titles = [b[1] for b in books]
+        titles = [b[1] for b in candidate_books]
         result = process.extractOne(text, titles, scorer=fuzz.WRatio)
         if result:
             _, score, idx = result
             if score >= MATCH_THRESHOLD:
-                matched_books = [books[idx]]
+                matched_books = [candidate_books[idx]]
 
     # لو مفيش تطابق منطقي، البوت ببساطة مايردش خالص - ده السلوك الطبيعي.
     if not matched_books:

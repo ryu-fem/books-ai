@@ -126,12 +126,14 @@ async def list_books_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for grade in order:
         if grade in grouped:
             lines = "\n".join(f"{bid}. {t}" for bid, t in grouped[grade])
-            sections.append(f"*{icons[grade]} {grade}*\n{lines}")
+            sections.append(f"{icons[grade]} {grade}\n{'-' * 20}\n{lines}")
 
-    text = "📚 *قائمة الكتب:*\n\n" + "\n\n".join(sections)
+    # ملحوظة: عمدًا من غير parse_mode (Markdown) عشان عناوين الكتب ممكن
+    # يكون فيها رموز زي _ أو * بتكسر التنسيق وتخلي الرسالة تفشل بالكامل
+    text = "📚 قائمة الكتب:\n\n" + "\n\n".join(sections)
     # تليجرام بيحدد أقصى طول للرسالة (4096 حرف)، لو القائمة كبيرة قوي نقسمها
     for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i + 4000], parse_mode="Markdown")
+        await update.message.reply_text(text[i:i + 4000])
 
 
 async def delete_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -219,6 +221,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """بيسجّل أي خطأ يحصل في أي handler في اللوجز، عشان مانفضلش من غير ما
+    نعرف السبب لما حاجة توقف عن الرد فجأة."""
+    logger.exception("حصل خطأ غير متوقع", exc_info=context.error)
+
+
 def main():
     if BOT_TOKEN == "ضع_التوكن_هنا" or OWNER_ID == 0:
         print("⚠️ لازم تحط BOT_TOKEN و OWNER_ID كمتغيرات بيئة قبل التشغيل.")
@@ -231,6 +239,7 @@ def main():
     app.add_handler(CommandHandler("addbook", add_book_cmd))
     app.add_handler(CommandHandler("listbooks", list_books_cmd))
     app.add_handler(CommandHandler("delbook", delete_book_cmd))
+    app.add_error_handler(error_handler)
 
     # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن)
     app.add_handler(

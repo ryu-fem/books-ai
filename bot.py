@@ -153,6 +153,42 @@ async def delete_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("مفيش كتاب بالرقم ده.")
 
 
+async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر تشخيصي للمالك بس: بيوري المسار الحقيقي لقاعدة البيانات جوه
+    الكونتينر، عشان نتأكد هل الـ Volume شغال فعلاً ولا لأ."""
+    if not is_owner(update.effective_user.id):
+        return
+
+    db_path_env = os.environ.get("DB_PATH", "(مش متظبط - بيستخدم books.db الافتراضي)")
+    abs_path = os.path.abspath(db.DB_PATH)
+    dir_path = os.path.dirname(abs_path) or "."
+    dir_exists = os.path.isdir(dir_path)
+    file_exists = os.path.isfile(abs_path)
+    file_size = os.path.getsize(abs_path) if file_exists else 0
+
+    dir_listing = ""
+    if dir_exists:
+        try:
+            entries = os.listdir(dir_path)
+            dir_listing = "\n".join(entries) if entries else "(فاضي)"
+        except Exception as exc:
+            dir_listing = f"(مقدرش أقرأ المجلد: {exc})"
+
+    books_count = len(db.get_all_books())
+
+    text = (
+        "🔍 معلومات قاعدة البيانات:\n\n"
+        f"DB_PATH env var: {db_path_env}\n"
+        f"المسار الفعلي: {abs_path}\n"
+        f"المجلد ({dir_path}) موجود؟ {'✅ آه' if dir_exists else '❌ لأ'}\n"
+        f"محتويات المجلد:\n{dir_listing}\n\n"
+        f"ملف قاعدة البيانات موجود؟ {'✅ آه' if file_exists else '❌ لأ'}\n"
+        f"حجم الملف: {file_size} بايت\n"
+        f"عدد الكتب المتضافة حاليًا: {books_count}"
+    )
+    await update.message.reply_text(text)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً! أنا بوت مكتبة. لو انت المالك ابعتلي كتاب في الخاص مع اسمه في الكابشن.\n"
@@ -239,6 +275,7 @@ def main():
     app.add_handler(CommandHandler("addbook", add_book_cmd))
     app.add_handler(CommandHandler("listbooks", list_books_cmd))
     app.add_handler(CommandHandler("delbook", delete_book_cmd))
+    app.add_handler(CommandHandler("dbinfo", dbinfo_cmd))
     app.add_error_handler(error_handler)
 
     # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن)

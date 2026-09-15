@@ -1,0 +1,2 @@
+python-telegram-bot==21.6
+rapidfuzz==3.9.7

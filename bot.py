@@ -13,7 +13,13 @@ from telegram.ext import (
 )
 
 import database as db
-from grading import detect_grade, detect_query_grade, grade_matches
+from grading import (
+    detect_grade,
+    detect_query_grade,
+    grade_matches,
+    detect_subject,
+    subject_matches,
+)
 from ai_matcher import ai_pick_books, AIMatchUnavailable
 
 logging.basicConfig(
@@ -214,15 +220,22 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not books:
         return
 
-    # فلترة أولى بالمرحلة الدراسية (لو واضحة في رسالة المستخدم) قبل ما
-    # نبعت أي حاجة للـ AI أصلاً - ده بيمنع تمامًا إن الموديل يرجع كتاب من
-    # مرحلة مختلفة عن اللي المستخدم طلبها.
+    # فلترة أولى بالمرحلة الدراسية *والمادة* (لو واضحين في رسالة المستخدم)
+    # قبل ما نبعت أي حاجة للـ AI أصلاً - ده بيمنع تمامًا إن الموديل يرجع
+    # كتاب من مرحلة أو مادة مختلفة عن اللي المستخدم طلبها. الفلترة دي
+    # "متحفظة": لو مقدرناش نحدد المرحلة أو المادة من النص، مبنرفضش الكتاب
+    # على أساسها ونسيب القرار للـ AI.
     query_grade = detect_query_grade(text)
-    candidate_books = [b for b in books if grade_matches(detect_grade(b[1]), query_grade)]
+    query_subject = detect_subject(text)
+    candidate_books = [
+        b for b in books
+        if grade_matches(detect_grade(b[1]), query_grade)
+        and subject_matches(detect_subject(b[1]), query_subject)
+    ]
 
-    # لو المستخدم حدد مرحلة واضحة ومفيش أي كتاب من المرحلة دي أصلاً، مفيش
-    # داعي نكلم الـ AI خالص.
-    if query_grade is not None and not candidate_books:
+    # لو المستخدم حدد مرحلة أو مادة واضحة ومفيش أي كتاب يطابقها أصلاً،
+    # مفيش داعي نكلم الـ AI خالص.
+    if (query_grade is not None or query_subject is not None) and not candidate_books:
         return
 
     # بنستخدم Groq API (مجاني بالكامل) عشان يحدد كل الكتب المطابقة بشرط إن

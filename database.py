@@ -20,7 +20,36 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY
+            )
+            """
+        )
         conn.commit()
+
+
+def remember_user(user_id: int):
+    """بيسجل أي مستخدم كلم البوت في الخاص، عشان نقدر نستخدمه بعدين في
+    أمر /broadcast. لو المستخدم مسجل قبل كده، مفيش تكرار (PRIMARY KEY)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)
+        )
+        conn.commit()
+
+
+def get_all_user_ids():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT user_id FROM users")
+        return [row[0] for row in cur.fetchall()]
+
+
+def count_users() -> int:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM users")
+        return cur.fetchone()[0]
 
 
 def add_book(title: str, file_id: str, file_name: str = None) -> int:

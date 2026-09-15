@@ -195,6 +195,59 @@ async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: بيوري عدد الكتب وعدد المستخدمين اللي كلموا البوت
+    في الخاص (اللي هيوصلهم أي /broadcast)."""
+    if not is_owner(update.effective_user.id):
+        return
+    books_count = len(db.get_all_books())
+    users_count = db.count_users()
+    await update.message.reply_text(
+        f"📊 إحصائيات:\n\n📚 عدد الكتب: {books_count}\n👤 عدد المستخدمين اللي كلموا البوت في الخاص: {users_count}"
+    )
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /broadcast الرسالة اللي عايز تبعتها لكل اللي كلموا
+    البوت في الخاص قبل كده. لازم تحط نص بعد الأمر."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /broadcast الرسالة اللي عايز تبعتها")
+        return
+
+    text = update.message.text.split(maxsplit=1)[1]
+    user_ids = db.get_all_user_ids()
+    if not user_ids:
+        await update.message.reply_text("مفيش أي مستخدم كلم البوت في الخاص لسه.")
+        return
+
+    sent, failed = 0, 0
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except Exception:
+            # ممكن يكون المستخدم عمل بلوك للبوت أو حظره، متجاهلينه ومكملين
+            failed += 1
+
+    await update.message.reply_text(f"✅ اتبعتت لـ {sent} مستخدم. فشلت مع {failed}.")
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: بيبعتله ملف قاعدة البيانات (books.db) كنسخة احتياطية."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not os.path.isfile(db.DB_PATH):
+        await update.message.reply_text("ملف قاعدة البيانات مش موجود.")
+        return
+    await update.message.reply_document(
+        document=open(db.DB_PATH, "rb"),
+        filename=os.path.basename(db.DB_PATH),
+        caption="📦 نسخة احتياطية من قاعدة البيانات",
+    )
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً! أنا بوت مكتبة. لو انت المالك ابعتلي كتاب في الخاص مع اسمه في الكابشن.\n"
@@ -203,14 +256,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- المطابقة الذكية في الجروب (بدون كلمة تريجر ثابتة) ----------
+# ---------- المطابقة الذكية في الجروب وفي الخاص (بدون كلمة تريجر ثابتة) ----------
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
         return
-    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+    chat_type = update.effective_chat.type
+    if chat_type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE):
         return
+
+    # لو حد كلم البوت في الخاص، بنسجله عشان نقدر نستخدم /broadcast بعدين
+    if chat_type == ChatType.PRIVATE:
+        db.remember_user(update.effective_user.id)
 
     text = message.text.strip()
     if len(text) < MIN_MESSAGE_LENGTH:
@@ -289,6 +347,9 @@ def main():
     app.add_handler(CommandHandler("listbooks", list_books_cmd))
     app.add_handler(CommandHandler("delbook", delete_book_cmd))
     app.add_handler(CommandHandler("dbinfo", dbinfo_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_error_handler(error_handler)
 
     # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن)
@@ -296,10 +357,10 @@ def main():
         MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_owner_upload)
     )
 
-    # أي رسالة نصية في الجروب
+    # أي رسالة نصية في الجروب أو في الخاص
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+            filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUPS | filters.ChatType.PRIVATE),
             group_message_handler,
         )
     )

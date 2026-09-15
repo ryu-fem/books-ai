@@ -1,10 +1,14 @@
+import os
 import sqlite3
 from contextlib import closing
 
-DB_PATH = "books.db"
+DB_PATH = os.environ.get("DB_PATH", "books.db")
 
 
 def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             """

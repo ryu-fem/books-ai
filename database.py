@@ -27,6 +27,17 @@ def init_db():
             )
             """
         )
+        # بتسجل كل طلب بحث (سواء لقى تطابق ولا لأ) عشان نقدر نطلع إحصائيات
+        # زي "كام طلب وصلك" و"كام واحد اتلقاله تطابق" - إجمالي أو النهاردة بس.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS requests_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                matched INTEGER NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -81,3 +92,34 @@ def get_book_by_id(book_id: int):
             "SELECT id, title, file_id, file_name FROM books WHERE id = ?", (book_id,)
         )
         return cur.fetchone()
+
+
+def log_request(matched: bool):
+    """بتسجل طلب بحث جديد (سواء لقى تطابق أو لأ) في السجل، عشان تتحسب في
+    إحصائيات /requests و /today."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT INTO requests_log (matched) VALUES (?)", (1 if matched else 0,)
+        )
+        conn.commit()
+
+
+def count_requests():
+    """بترجع (الإجمالي, اللي لقى تطابق, اللي ملقاش) لكل الطلبات المسجلة
+    من أول ما البوت اشتغل."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT COUNT(*), COALESCE(SUM(matched), 0) FROM requests_log")
+        total, matched = cur.fetchone()
+        return total, matched, total - matched
+
+
+def count_requests_today():
+    """زي count_requests بس للطلبات اللي حصلت النهاردة بس (حسب توقيت
+    السيرفر اللي شغال عليه البوت)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(matched), 0) FROM requests_log "
+            "WHERE date(ts) = date('now')"
+        )
+        total, matched = cur.fetchone()
+        return total, matched, total - matched

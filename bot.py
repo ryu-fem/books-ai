@@ -326,6 +326,51 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def find_duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: بيفحص كل الكتب المتضافة ويجمع اللي أسماءهم شبه
+    بعض قوي (بنفس نسبة التشابه المستخدمة وقت رفع كتاب جديد) في مجموعات،
+    عشان تقدر تكتشف كتب اتضافت مرتين بالغلط."""
+    if not is_owner(update.effective_user.id):
+        return
+
+    books = db.get_all_books()
+    if len(books) < 2:
+        await update.message.reply_text("مفيش كتب كفاية عشان نقارن.")
+        return
+
+    groups = []
+    used = set()
+    for i, book_a in enumerate(books):
+        if book_a[0] in used:
+            continue
+        group = [book_a]
+        for book_b in books[i + 1:]:
+            if book_b[0] in used:
+                continue
+            score = fuzz.WRatio(book_a[1], book_b[1])
+            if score >= DUPLICATE_THRESHOLD:
+                group.append(book_b)
+                used.add(book_b[0])
+        if len(group) > 1:
+            used.add(book_a[0])
+            groups.append(group)
+
+    if not groups:
+        await update.message.reply_text("✅ مفيش أي كتب متكررة أو متشابهة قوي.")
+        return
+
+    lines = [f"⚠️ لقيت {len(groups)} مجموعة كتب شبه بعض:\n"]
+    for idx, group in enumerate(groups, start=1):
+        lines.append(f"مجموعة {idx}:")
+        for b in group:
+            lines.append(f"  #{b[0]} - {b[1]}")
+        lines.append("")
+    text = "\n".join(lines)
+    # تليجرام بيحدد أقصى طول للرسالة (4096 حرف)، لو القائمة كبيرة قوي نقسمها
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً! أنا بوت مكتبة. لو انت المالك ابعتلي كتاب في الخاص مع اسمه في الكابشن.\n"
@@ -457,6 +502,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("dupes", find_duplicates_cmd))
     app.add_handler(CallbackQueryHandler(duplicate_decision_cb, pattern="^dup_"))
     app.add_error_handler(error_handler)
 

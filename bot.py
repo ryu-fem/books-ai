@@ -383,8 +383,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
     """بترد على الشخص إن الكتاب مش متوفر حاليًا، وتبلغ المالك بالطلب ده
-    عشان يعرف الكتب المطلوبة اللي لسه مضافاهاش. مبنبلغش المالك لو هو
-    نفسه اللي بيدور (زي لما يجرب يبحث بنفسه)."""
+    عشان يعرف الكتب المطلوبة اللي لسه مضافاهاش، ومعاها زرار "رد على
+    الشخص ده" عشان المالك يقدر يرد عليه مباشرة من غير ما يعرف الشات
+    بتاعه بنفسه. مبنبلغش المالك لو هو نفسه اللي بيدور (زي لما يجرب يبحث
+    بنفسه)."""
     await update.message.reply_text("😔 الكتاب ده مش متوفر حاليًا.")
 
     user = update.effective_user
@@ -394,6 +396,19 @@ async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     chat = update.effective_chat
     chat_label = "الخاص" if chat.type == ChatType.PRIVATE else (chat.title or "جروب")
     username = f"@{user.username}" if user.username else user.full_name
+
+    # بنخزن مكان الرسالة الأصلية (الشات ورقم الرسالة) عشان لو المالك دوس
+    # على زرار الرد، نقدر نبعت رده كـ reply على نفس الرسالة دي في نفس
+    # الشات (سواء جروب أو خاص)، من غير ما يحتاج يعرف حاجة تانية.
+    key = f"{chat.id}_{update.message.message_id}"
+    context.bot_data.setdefault("pending_reply_targets", {})[key] = {
+        "chat_id": chat.id,
+        "message_id": update.message.message_id,
+        "user_label": username,
+    }
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ رد على الشخص ده", callback_data=f"replyto:{key}")],
+    ])
     try:
         await context.bot.send_message(
             chat_id=OWNER_ID,
@@ -403,9 +418,67 @@ async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, q
                 f"مكان الرسالة: {chat_label}\n"
                 f"النص: {query_text}"
             ),
+            reply_markup=keyboard,
         )
     except Exception:
         logger.exception("فشل إرسال تنبيه للمالك عن كتاب مش متوفر")
+
+
+async def reply_target_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بيتنفذ لما المالك يدوس زرار "رد على الشخص ده" تحت تنبيه كتاب مش
+    متوفر. بيحط المالك في وضع "انتظار رد": أول رسالة نصية يبعتها في
+    الخاص بعد كده تتبعت تلقائي للشخص اللي سأل (كـ reply على رسالته
+    الأصلية)، بدل ما تتفحص كطلب كتاب عادي."""
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+
+    _, _, key = query.data.partition(":")
+    pending = context.bot_data.get("pending_reply_targets", {})
+    target = pending.get(key)
+    if not target:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⏳ الطلب ده قديم أو اتعمل فيه رد قبل كده.",
+        )
+        return
+
+    context.bot_data.setdefault("awaiting_reply", {})[query.from_user.id] = target
+    await query.edit_message_reply_markup(reply_markup=None)
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=f"✍️ تمام، ابعت دلوقتي رسالتك في الخاص هنا وهتتبعت لـ {target['user_label']}.",
+    )
+
+
+async def notify_owner_success(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                query_text: str, matched_books: list):
+    """بتبلغ المالك إن طلب حد اتحقق فعلاً وابعتله كتاب/كتب تلقائي، عشان
+    يقدر يتابع الطلبات اللي البوت بيردها من غير تدخله. مبنبلغش المالك لو
+    هو نفسه اللي بيدور."""
+    user = update.effective_user
+    if not OWNER_ID or user.id == OWNER_ID:
+        return
+
+    chat = update.effective_chat
+    chat_label = "الخاص" if chat.type == ChatType.PRIVATE else (chat.title or "جروب")
+    username = f"@{user.username}" if user.username else user.full_name
+    titles = "\n".join(f"- {b[1]}" for b in matched_books)
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "✅ اتبعت كتاب تلقائي لحد سأل عنه:\n\n"
+                f"من: {username}\n"
+                f"مكان الرسالة: {chat_label}\n"
+                f"النص: {query_text}\n\n"
+                f"الكتب اللي اتبعتت:\n{titles}"
+            ),
+        )
+    except Exception:
+        logger.exception("فشل إرسال تنبيه للمالك عن كتاب اتبعت بنجاح")
 
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -416,9 +489,30 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if chat_type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE):
         return
 
+    user = update.effective_user
+
+    # لو المالك في وضع "انتظار رد" (دوس زرار "رد على الشخص ده" تحت تنبيه
+    # كتاب مش متوفر)، أول رسالة نصية يبعتها في الخاص بعد كده تتبعت
+    # تلقائي للشخص ده بدل ما تتفحص كطلب كتاب عادي.
+    if chat_type == ChatType.PRIVATE and is_owner(user.id):
+        awaiting = context.bot_data.get("awaiting_reply", {})
+        target = awaiting.pop(user.id, None)
+        if target:
+            try:
+                await context.bot.send_message(
+                    chat_id=target["chat_id"],
+                    text=message.text,
+                    reply_to_message_id=target["message_id"],
+                )
+                await message.reply_text(f"✅ اتبعتت لـ {target['user_label']}.")
+            except Exception:
+                logger.exception("فشل إرسال رد المالك للشخص")
+                await message.reply_text("❌ حصلت مشكلة وأنا بابعت الرد، جرب تاني.")
+            return
+
     # لو حد كلم البوت في الخاص، بنسجله عشان نقدر نستخدم /broadcast بعدين
     if chat_type == ChatType.PRIVATE:
-        db.remember_user(update.effective_user.id)
+        db.remember_user(user.id)
 
     text = message.text.strip()
     if len(text) < MIN_MESSAGE_LENGTH:
@@ -479,6 +573,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             reply_to_message_id=message.message_id,
         )
 
+    await notify_owner_success(update, context, text, matched_books)
+
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     """بيسجّل أي خطأ يحصل في أي handler في اللوجز، عشان مانفضلش من غير ما
@@ -504,6 +600,7 @@ def main():
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("dupes", find_duplicates_cmd))
     app.add_handler(CallbackQueryHandler(duplicate_decision_cb, pattern="^dup_"))
+    app.add_handler(CallbackQueryHandler(reply_target_cb, pattern="^replyto:"))
     app.add_error_handler(error_handler)
 
     # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن)

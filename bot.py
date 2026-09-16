@@ -2,12 +2,13 @@ import logging
 import os
 
 from rapidfuzz import process, fuzz
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -39,9 +40,88 @@ MATCH_THRESHOLD = 85  # نسبة التشابه المطلوبة في المطا
 # مشتركة زي "بكالوريا" أو "ثانوي" - المفروض الاحتياطي ده نادر الاستخدام
 # أصلاً، الاعتماد الحقيقي على الـ AI في ai_matcher.py)
 
+DUPLICATE_THRESHOLD = 90  # نسبة التشابه اللي لو كتاب جديد وصلها مع كتاب
+# موجود قبل كده، بنعتبره "نفس الكتاب تقريبًا" ونسأل المالك يعمل ايه
+
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
+
+
+def find_duplicate_book(title: str):
+    """بيدور على كتاب موجود قبل كده باسم شبيه قوي (مش لازم متطابق حرفيًا)
+    عشان نمنع تكرار نفس الكتاب بالغلط. بيرجع (id, title, file_id,
+    file_name) لو لقى حاجة، أو None لو مفيش تشابه كافي."""
+    books = db.get_all_books()
+    if not books:
+        return None
+    titles = [b[1] for b in books]
+    result = process.extractOne(title, titles, scorer=fuzz.WRatio)
+    if result:
+        _, score, idx = result
+        if score >= DUPLICATE_THRESHOLD:
+            return books[idx]
+    return None
+
+
+async def handle_new_book(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           title: str, file_id: str, file_name: str):
+    """نقطة مركزية لإضافة أي كتاب جديد (سواء من /addbook أو رفع مباشر).
+    لو لقينا كتاب شبيه قوي موجود قبل كده، منضيفوش على طول - بنسأل المالك
+    الأول عايز يسيب الاتنين ولا يمسح القديم ويستبدله بالجديد."""
+    duplicate = find_duplicate_book(title)
+    if duplicate:
+        dup_id, dup_title = duplicate[0], duplicate[1]
+        key = f"{update.effective_chat.id}_{update.message.message_id}"
+        context.bot_data.setdefault("pending_duplicates", {})[key] = {
+            "title": title, "file_id": file_id, "file_name": file_name,
+            "old_id": dup_id,
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ سيبهم الاتنين", callback_data=f"dup_keep:{key}")],
+            [InlineKeyboardButton("🗑️ امسح القديم واستبدله", callback_data=f"dup_replace:{key}")],
+        ])
+        await update.message.reply_text(
+            "⚠️ لقيت كتاب شبيه موجود قبل كده:\n"
+            f"#{dup_id} - {dup_title}\n\n"
+            f"الكتاب الجديد: {title}\n\n"
+            "عايز تعمل ايه؟",
+            reply_markup=keyboard,
+        )
+        return
+
+    book_id = db.add_book(title=title, file_id=file_id, file_name=file_name)
+    await update.message.reply_text(f"✅ تمت إضافة الكتاب رقم {book_id}: {title}")
+
+
+async def duplicate_decision_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بيتنفذ لما المالك يدوس على زرار (سيبهم الاتنين / امسح القديم) بعد
+    ما اكتشفنا كتاب شبيه."""
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+
+    action, _, key = query.data.partition(":")
+    pending = context.bot_data.get("pending_duplicates", {})
+    data = pending.pop(key, None)
+    if not data:
+        await query.edit_message_text("⏳ الطلب ده اتعمل فيه حاجة قبل كده أو منتهي.")
+        return
+
+    if action == "dup_replace":
+        db.delete_book(data["old_id"])
+
+    book_id = db.add_book(title=data["title"], file_id=data["file_id"],
+                           file_name=data["file_name"])
+    if action == "dup_replace":
+        await query.edit_message_text(
+            f"🗑️➡️✅ اتمسح القديم واتضاف الكتاب الجديد رقم {book_id}: {data['title']}"
+        )
+    else:
+        await query.edit_message_text(
+            f"✅ اتضاف الكتاب الجديد رقم {book_id}: {data['title']} (والقديم لسه موجود)"
+        )
 
 
 # ---------- أوامر المالك ----------
@@ -73,8 +153,7 @@ async def add_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    book_id = db.add_book(title=title, file_id=doc.file_id, file_name=doc.file_name)
-    await message.reply_text(f"✅ تمت إضافة الكتاب رقم {book_id}: {title}")
+    await handle_new_book(update, context, title, doc.file_id, doc.file_name)
 
 
 async def handle_owner_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -92,9 +171,8 @@ async def handle_owner_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     title = message.caption.strip()
-    book_id = db.add_book(title=title, file_id=message.document.file_id,
-                           file_name=message.document.file_name)
-    await message.reply_text(f"✅ اتضاف الكتاب رقم {book_id}: {title}")
+    await handle_new_book(update, context, title, message.document.file_id,
+                           message.document.file_name)
 
 
 async def list_books_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,6 +336,33 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- المطابقة الذكية في الجروب وفي الخاص (بدون كلمة تريجر ثابتة) ----------
 
+async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
+    """بترد على الشخص إن الكتاب مش متوفر حاليًا، وتبلغ المالك بالطلب ده
+    عشان يعرف الكتب المطلوبة اللي لسه مضافاهاش. مبنبلغش المالك لو هو
+    نفسه اللي بيدور (زي لما يجرب يبحث بنفسه)."""
+    await update.message.reply_text("😔 الكتاب ده مش متوفر حاليًا.")
+
+    user = update.effective_user
+    if not OWNER_ID or user.id == OWNER_ID:
+        return
+
+    chat = update.effective_chat
+    chat_label = "الخاص" if chat.type == ChatType.PRIVATE else (chat.title or "جروب")
+    username = f"@{user.username}" if user.username else user.full_name
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "📩 حد سأل عن كتاب مش موجود عندك:\n\n"
+                f"من: {username}\n"
+                f"مكان الرسالة: {chat_label}\n"
+                f"النص: {query_text}"
+            ),
+        )
+    except Exception:
+        logger.exception("فشل إرسال تنبيه للمالك عن كتاب مش متوفر")
+
+
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -292,8 +397,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     ]
 
     # لو المستخدم حدد مرحلة أو مادة واضحة ومفيش أي كتاب يطابقها أصلاً،
-    # مفيش داعي نكلم الـ AI خالص.
+    # مفيش داعي نكلم الـ AI خالص - بس نبلغ الشخص والمالك إن الكتاب مش موجود.
     if (query_grade is not None or query_subject is not None) and not candidate_books:
+        await notify_not_found(update, context, text)
         return
 
     # بنستخدم Groq API (مجاني بالكامل) عشان يحدد كل الكتب المطابقة بشرط إن
@@ -314,8 +420,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             if score >= MATCH_THRESHOLD:
                 matched_books = [candidate_books[idx]]
 
-    # لو مفيش تطابق منطقي، البوت ببساطة مايردش خالص - ده السلوك الطبيعي.
+    # لو مفيش تطابق منطقي، نبلغ الشخص إن الكتاب مش متوفر ونبلغ المالك بالطلب.
     if not matched_books:
+        await notify_not_found(update, context, text)
         return
 
     for book in matched_books:
@@ -350,6 +457,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CallbackQueryHandler(duplicate_decision_cb, pattern="^dup_"))
     app.add_error_handler(error_handler)
 
     # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن)

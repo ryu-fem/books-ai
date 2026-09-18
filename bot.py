@@ -56,8 +56,8 @@ MAX_REASON_LENGTH = 500
 
 # رسالة التعليمات الثابتة (بتتبعت في /start وفي الخاص لو الرسالة مش طلب كتاب)
 HELP_TEXT = (
-    "أهلاً! أنا بوت مكتبة 📚\n"
-    "اكتب اسم الكتاب اللي عايزه (أو المرحلة والمادة، أو اسم المؤلف) وهبعتهولك لو موجود.\n\n"
+    "أهلاً بيك 👋\n"
+    "اكتب اسم الكتاب اللي عايزه (أو اسم المادة والمرحلة، أو اسم المؤلف) وهبعتهولك لو موجود.\n\n"
     "📥 عندك كتاب مش موجود عندنا؟ ابعتهولي هنا في الخاص كملف مع اسمه في الكابشن، "
     "وهتتم مراجعته من الإدارة."
 )
@@ -460,10 +460,7 @@ async def find_duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ---------- أوامر عامة وتشخيصية ----------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = HELP_TEXT
-    if is_owner(update.effective_user.id):
-        text += "\n\n👑 وانت المالك: ابعت /help عشان تشوف كل الأوامر."
-    await update.message.reply_text(text)
+    await update.message.reply_text(HELP_TEXT)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,7 +485,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/requests - إجمالي عدد طلبات البحث من الأول (لقت/ملقتش)\n"
         "/today - طلبات البحث النهاردة بس\n\n"
         "📢 التواصل\n"
-        "/broadcast رسالتك - يبعت رسالة لكل اللي كلموا البوت في الخاص\n\n"
+        "/broadcast رسالتك - يبعت رسالة لكل اللي كلموا البوت في الخاص\n"
+        "/msg آيدي رسالتك - يبعت رسالة لشخص واحد بس بالآيدي بتاعه\n\n"
         "🔧 تشخيص\n"
         "/dbinfo - معلومات عن قاعدة البيانات ومكانها\n"
         "/backup - يبعتلك نسخة احتياطية من قاعدة البيانات"
@@ -567,6 +565,8 @@ async def today_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /broadcast الرسالة اللي عايز تبعتها لكل اللي كلموا
+    البوت في الخاص قبل كده."""
     if not is_owner(update.effective_user.id):
         return
     if not context.args:
@@ -588,6 +588,32 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
 
     await update.message.reply_text(f"✅ اتبعتت لـ {sent} مستخدم. فشلت مع {failed}.")
+
+
+async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /msg آيدي_المستخدم نص الرسالة - بيبعت رسالة لشخص
+    واحد بس بالآيدي بتاعه (تقدر تلاقي الآيدي في إشعارات الطلبات أو
+    /subs). لو المستخدم عامل بلوك للبوت أو الآيدي غلط، هيوضحلك."""
+    if not is_owner(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("استخدم: /msg آيدي_المستخدم نص الرسالة")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آيدي المستخدم لازم يكون رقم.")
+        return
+
+    text = update.message.text.split(maxsplit=2)[2]
+    try:
+        await context.bot.send_message(chat_id=target_id, text=text)
+        await update.message.reply_text("✅ اتبعتت.")
+    except Exception:
+        logger.exception("فشل إرسال رسالة مباشرة للمستخدم %s", target_id)
+        await update.message.reply_text(
+            "❌ مقدرتش أبعت الرسالة (ممكن يكون الآيدي غلط أو المستخدم عامل بلوك للبوت)."
+        )
 
 
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,10 +658,11 @@ async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, q
             chat_id=OWNER_ID,
             text=(
                 "📩 حد سأل عن كتاب مش موجود عندك:\n\n"
-                f"من: {username}\n"
+                f"من: {username} (ID: {user.id})\n"
                 f"مكان الرسالة: {chat_label}\n"
                 f"النص: {query_text}\n\n"
-                f"عشان ترد عليه: /reply {reply_id} نص ردك"
+                f"عشان ترد عليه: /reply {reply_id} نص ردك\n"
+                f"أو تبعتله رسالة منفصلة: /msg {user.id} نص الرسالة"
             ),
         )
     except Exception:
@@ -812,6 +839,7 @@ def main():
     app.add_handler(CommandHandler("requests", requests_stats_cmd))
     app.add_handler(CommandHandler("today", today_stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("msg", msg_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("dupes", find_duplicates_cmd))
     app.add_handler(CommandHandler("subs", subs_cmd))

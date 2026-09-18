@@ -7,13 +7,26 @@
 (مرحلة أو مادة) من النص، بترجع None وتسيب القرار للـ AI بدل ما ترفض غلط.
 """
 
+import re
+
+# التشكيل + التطويل - بنشيلهم عشان "الفِيزياء" و"الفيـزياء" يتعاملوا زي "الفيزياء"
+_DIACRITICS = re.compile("[\u064B-\u065F\u0670\u0640]")
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
 
 def _normalize(text: str) -> str:
-    t = text
+    t = text.lower()  # عشان English / english يتطابقوا
+    t = _DIACRITICS.sub("", t)
+    t = t.translate(_ARABIC_DIGITS)
     t = t.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     t = t.replace("ة", "ه")
     t = t.replace("ى", "ي")
     return t
+
+
+# نسخة عامة من نفس الدالة، عشان الملفات التانية (البوت والـ AI) تستخدمها
+# في المقارنات النصية بدل ما كل واحد يعمل تطبيع مختلف.
+normalize_text = _normalize
 
 
 # ---------------- المرحلة الدراسية ----------------
@@ -122,6 +135,18 @@ _SUBJECT_KEYWORDS = [
 ]
 
 
+# بادئات عربية شائعة ممكن تسبق اسم المادة (الفيزياء، بالفيزياء، للفيزياء..)
+_PREFIX = r"(?:وال|بال|لل|ال|و|ب|ل)?"
+
+
+def _has_keyword(normalized_text: str, keyword: str) -> bool:
+    """بيدور على الكلمة المفتاحية كبداية كلمة (مع السماح ببادئة زي "ال")،
+    مش كجزء عشوائي جوه كلمة تانية - عشان "معلومات" مثلاً ماتتحسبش مادة
+    "علوم"."""
+    pattern = r"(?<!\w)" + _PREFIX + re.escape(_normalize(keyword))
+    return re.search(pattern, normalized_text) is not None
+
+
 def detect_subject(text: str):
     """بيحاول يحدد المادة الدراسية من النص (عنوان كتاب أو رسالة مستخدم).
     بيرجع اسم المادة لو لقى كلمة مفتاحية واضحة، أو None لو مقدرش يحدد -
@@ -130,7 +155,7 @@ def detect_subject(text: str):
     t = _normalize(text)
     for subject, keywords in _SUBJECT_KEYWORDS:
         for kw in keywords:
-            if _normalize(kw) in t:
+            if _has_keyword(t, kw):
                 return subject
     return None
 

@@ -1,14 +1,14 @@
+import asyncio
 import logging
 import os
 
 from rapidfuzz import process, fuzz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -20,8 +20,14 @@ from grading import (
     grade_matches,
     detect_subject,
     subject_matches,
+    normalize_text,
 )
-from ai_matcher import ai_pick_books, AIMatchUnavailable
+from ai_matcher import (
+    ai_pick_books,
+    AIMatchUnavailable,
+    has_book_word,
+    might_be_book_request,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -41,16 +47,35 @@ MATCH_THRESHOLD = 85  # نسبة التشابه المطلوبة في المطا
 # أصلاً، الاعتماد الحقيقي على الـ AI في ai_matcher.py)
 
 DUPLICATE_THRESHOLD = 90  # نسبة التشابه اللي لو كتاب جديد وصلها مع كتاب
-# موجود قبل كده، بنعتبره "نفس الكتاب تقريبًا" ونسأل المالك يعمل ايه
+# موجود قبل كده، بنعتبره "نفس الكتاب تقريبًا" ونحذّر المالك (من غير ما نمنعه)
+
+# طلبات إضافة الكتب من المستخدمين
+MAX_PENDING_SUBMISSIONS = 5  # أقصى عدد طلبات معلقة للمستخدم الواحد (ضد السبام)
+MAX_TITLE_LENGTH = 200
+MAX_REASON_LENGTH = 500
+
+# رسالة التعليمات الثابتة (بتتبعت في /start وفي الخاص لو الرسالة مش طلب كتاب)
+HELP_TEXT = (
+    "أهلاً! أنا بوت مكتبة 📚\n"
+    "اكتب اسم الكتاب اللي عايزه (أو المرحلة والمادة، أو اسم المؤلف) وهبعتهولك لو موجود.\n\n"
+    "📥 عندك كتاب مش موجود عندنا؟ ابعتهولي هنا في الخاص كملف مع اسمه في الكابشن، "
+    "وهتتم مراجعته من الإدارة."
+)
 
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 
+def _user_label(user) -> str:
+    return f"@{user.username}" if user.username else user.full_name
+
+
+# ---------- إضافة كتاب (فحص التكرار من غير ما نمنع الإضافة) ----------
+
 def find_duplicate_book(title: str):
     """بيدور على كتاب موجود قبل كده باسم شبيه قوي (مش لازم متطابق حرفيًا)
-    عشان نمنع تكرار نفس الكتاب بالغلط. بيرجع (id, title, file_id,
+    عشان نلفت نظر المالك لاحتمال التكرار. بيرجع (id, title, file_id,
     file_name) لو لقى حاجة، أو None لو مفيش تشابه كافي."""
     books = db.get_all_books()
     if not books:
@@ -66,69 +91,192 @@ def find_duplicate_book(title: str):
 
 async def handle_new_book(update: Update, context: ContextTypes.DEFAULT_TYPE,
                            title: str, file_id: str, file_name: str):
-    """نقطة مركزية لإضافة أي كتاب جديد (سواء من /addbook أو رفع مباشر).
-    لو لقينا كتاب شبيه قوي موجود قبل كده، منضيفوش على طول - بنسأل المالك
-    الأول عايز يسيب الاتنين ولا يمسح القديم ويستبدله بالجديد."""
+    """نقطة مركزية لإضافة أي كتاب جديد (سواء من /addbook أو رفع مباشر من
+    المالك، أو /accept على طلب مستخدم). بنضيف الكتاب على طول، ولو لقينا
+    كتاب شبيه قوي موجود قبل كده، بنحذّر المالك بس في نفس الرسالة (من غير
+    ما نمنع الإضافة أو نسأله بأزرار) - يقدر يمسح القديم بـ /delbook لو حابب."""
     duplicate = find_duplicate_book(title)
+    book_id = db.add_book(title=title, file_id=file_id, file_name=file_name)
+    msg = f"✅ تمت إضافة الكتاب رقم {book_id}: {title}"
     if duplicate:
         dup_id, dup_title = duplicate[0], duplicate[1]
-        key = f"{update.effective_chat.id}_{update.message.message_id}"
-        context.bot_data.setdefault("pending_duplicates", {})[key] = {
-            "title": title, "file_id": file_id, "file_name": file_name,
-            "old_id": dup_id,
-        }
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ سيبهم الاتنين", callback_data=f"dup_keep:{key}")],
-            [InlineKeyboardButton("🗑️ امسح القديم واستبدله", callback_data=f"dup_replace:{key}")],
-        ])
-        await update.message.reply_text(
-            "⚠️ لقيت كتاب شبيه موجود قبل كده:\n"
-            f"#{dup_id} - {dup_title}\n\n"
-            f"الكتاب الجديد: {title}\n\n"
-            "عايز تعمل ايه؟",
-            reply_markup=keyboard,
+        msg += (
+            f"\n\n⚠️ ملحوظة: لقيت كتاب شبيه موجود قبل كده:\n"
+            f"#{dup_id} - {dup_title}\n"
+            f"لو عايز تمسح القديم: /delbook {dup_id}"
+        )
+    await update.message.reply_text(msg)
+
+
+# ---------- طلبات إضافة كتب من المستخدمين (بأوامر بس، من غير أزرار) ----------
+# المسار: مستخدم يبعت ملف في الخاص -> يتسجل كطلب معلّق ويوصل تنبيه نصي
+# للمالك فيه رقم الطلب -> المالك يستخدم /accept رقم [اسم بديل] أو
+# /reject رقم [سبب] عشان يحسم الطلب.
+
+def _submission_summary(sub) -> str:
+    """نص وصف الطلب. sub = صف من db.get_submission."""
+    sub_id, user_id, username, title, file_id, file_name, status = sub
+    return (
+        f"#{sub_id} - {title}\n"
+        f"من: {username} (ID: {user_id})\n"
+        f"الملف: {file_name or '-'}\n"
+        f"الحالة: {status}"
+    )
+
+
+async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أي مستخدم (مش المالك) بيبعت ملف في الخاص = طلب إضافة كتاب للمراجعة."""
+    user, message = update.effective_user, update.message
+    doc = message.document
+    db.remember_user(user.id)
+
+    if not OWNER_ID:
+        await message.reply_text("⚠️ استقبال الكتب مش متاح دلوقتي.")
+        return
+    if db.count_pending_submissions(user.id) >= MAX_PENDING_SUBMISSIONS:
+        await message.reply_text(
+            f"⏳ عندك {MAX_PENDING_SUBMISSIONS} طلبات لسه بتتراجع. "
+            "استنى لما الإدارة ترد عليهم وبعدين ابعت تاني."
         )
         return
 
-    book_id = db.add_book(title=title, file_id=file_id, file_name=file_name)
-    await update.message.reply_text(f"✅ تمت إضافة الكتاب رقم {book_id}: {title}")
-
-
-async def duplicate_decision_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بيتنفذ لما المالك يدوس على زرار (سيبهم الاتنين / امسح القديم) بعد
-    ما اكتشفنا كتاب شبيه."""
-    query = update.callback_query
-    await query.answer()
-    if not is_owner(query.from_user.id):
+    title = (message.caption or "").strip()
+    if not title:  # مفيش كابشن -> نستخدم اسم الملف من غير الامتداد
+        title = os.path.splitext(doc.file_name or "")[0].replace("_", " ").strip()
+    title = title[:MAX_TITLE_LENGTH]
+    if not title:
+        await message.reply_text("من فضلك ابعت الملف تاني وحط اسم الكتاب في الكابشن.")
         return
 
-    action, _, key = query.data.partition(":")
-    pending = context.bot_data.get("pending_duplicates", {})
-    data = pending.pop(key, None)
-    if not data:
-        await query.edit_message_text("⏳ الطلب ده اتعمل فيه حاجة قبل كده أو منتهي.")
+    sub_id = db.add_submission(user.id, _user_label(user), title, doc.file_id, doc.file_name)
+    similar = find_duplicate_book(title)
+
+    owner_text = (
+        f"📥 طلب إضافة كتاب #{sub_id}\n\n"
+        f"📖 الاسم المقترح: {title}\n"
+        f"👤 من: {_user_label(user)} (ID: {user.id})\n"
+        f"📎 الملف: {doc.file_name or '-'}"
+    )
+    if similar:
+        owner_text += f"\n⚠️ شبيه بكتاب موجود: #{similar[0]} - {similar[1]}"
+    owner_text += (
+        f"\n\n✅ للقبول: /accept {sub_id} [اسم بديل اختياري]"
+        f"\n❌ للرفض: /reject {sub_id} [سبب اختياري]"
+    )
+
+    try:
+        await context.bot.send_document(
+            chat_id=OWNER_ID,
+            document=doc.file_id,
+            caption=owner_text[:1024],
+        )
+    except Exception:
+        logger.exception("فشل إرسال طلب إضافة كتاب للمالك")
+        await message.reply_text("⚠️ حصلت مشكلة وأنا بوصّل طلبك للإدارة، جرّب تاني بعد شوية.")
         return
 
-    if action == "dup_replace":
-        db.delete_book(data["old_id"])
+    await message.reply_text(
+        f"✅ استلمت الكتاب \"{title}\" وبعتّه للإدارة للمراجعة. "
+        "هبلغك أول ما يتم القبول أو الرفض."
+    )
 
-    book_id = db.add_book(title=data["title"], file_id=data["file_id"],
-                           file_name=data["file_name"])
-    if action == "dup_replace":
-        await query.edit_message_text(
-            f"🗑️➡️✅ اتمسح القديم واتضاف الكتاب الجديد رقم {book_id}: {data['title']}"
+
+async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /accept رقم_الطلب [اسم بديل اختياري]
+    لو معملتش اسم بديل، بيستخدم الاسم اللي المستخدم اقترحه."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /accept رقم_الطلب [اسم بديل اختياري]")
+        return
+    try:
+        sub_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("رقم الطلب لازم يكون رقم.")
+        return
+
+    sub = db.get_submission(sub_id)
+    if not sub or sub[6] != "pending":
+        await update.message.reply_text("⏳ الطلب ده مش موجود أو اتعالج قبل كده.")
+        return
+
+    override_name = " ".join(context.args[1:]).strip()
+    name = (override_name or sub[3])[:MAX_TITLE_LENGTH]
+    book_id = db.add_book(title=name, file_id=sub[4], file_name=sub[5])
+    db.resolve_submission(sub_id, "accepted")
+
+    try:
+        await context.bot.send_message(
+            chat_id=sub[1],
+            text=f"🎉 الكتاب اللي بعتّه اتقبل واتضاف للمكتبة باسم:\n{name}",
         )
-    else:
-        await query.edit_message_text(
-            f"✅ اتضاف الكتاب الجديد رقم {book_id}: {data['title']} (والقديم لسه موجود)"
-        )
+        notified = True
+    except Exception:
+        logger.warning("مقدرتش أبلغ المستخدم %s بقبول طلبه #%s", sub[1], sub_id)
+        notified = False
+
+    result = f"✅ اتقبل واتضاف كتاب رقم {book_id}: {name}"
+    if not notified:
+        result += "\n⚠️ مقدرتش أبلغ المستخدم (ممكن يكون عمل بلوك للبوت)."
+    await update.message.reply_text(result)
 
 
-# ---------- أوامر المالك ----------
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /reject رقم_الطلب [سبب اختياري]"""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /reject رقم_الطلب [سبب اختياري]")
+        return
+    try:
+        sub_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("رقم الطلب لازم يكون رقم.")
+        return
+
+    sub = db.get_submission(sub_id)
+    if not sub or sub[6] != "pending":
+        await update.message.reply_text("⏳ الطلب ده مش موجود أو اتعالج قبل كده.")
+        return
+
+    reason = " ".join(context.args[1:]).strip()[:MAX_REASON_LENGTH]
+    db.resolve_submission(sub_id, "rejected")
+
+    user_msg = f"😔 للأسف الكتاب اللي بعتّه ({sub[3]}) اترفض."
+    if reason:
+        user_msg += f"\nالسبب: {reason}"
+    try:
+        await context.bot.send_message(chat_id=sub[1], text=user_msg)
+        notified = True
+    except Exception:
+        logger.warning("مقدرتش أبلغ المستخدم %s برفض طلبه #%s", sub[1], sub_id)
+        notified = False
+
+    result = f"❌ اترفض الطلب #{sub_id}" + (f"\nالسبب: {reason}" if reason else " (من غير سبب)")
+    if not notified:
+        result += "\n⚠️ مقدرتش أبلغ المستخدم (ممكن يكون عمل بلوك للبوت)."
+    await update.message.reply_text(result)
+
+
+async def subs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /subs - بيعرض كل طلبات إضافة الكتب المعلّقة."""
+    if not is_owner(update.effective_user.id):
+        return
+    pending = db.get_pending_submissions()
+    if not pending:
+        await update.message.reply_text("مفيش طلبات معلّقة دلوقتي.")
+        return
+    lines = [_submission_summary(sub) for sub in pending]
+    text = "📥 الطلبات المعلّقة:\n\n" + "\n\n".join(lines)
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+# ---------- أوامر المالك: الكتب ----------
 
 async def add_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    يُستخدم في الخاص مع المالك فقط:
+    يُستخدم في الخاص مع المالك بس:
     ترفع ملف الكتاب (PDF مثلا) مع كابشن هو اسم الكتاب، أو ترد على الملف بالأمر:
     /addbook اسم الكتاب
     """
@@ -157,12 +305,14 @@ async def add_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_owner_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أي ملف يبعته المالك في الخاص مع كابشن، يتضاف تلقائي كـ كتاب."""
+    """أي ملف يبعته المالك في الخاص مع كابشن، يتضاف تلقائي كـ كتاب. أي مستخدم
+    تاني بيبعت ملف في الخاص، بيتعامل معاه كطلب إضافة كتاب (للمراجعة)."""
     user = update.effective_user
     message = update.message
-    if not is_owner(user.id) or update.effective_chat.type != ChatType.PRIVATE:
+    if update.effective_chat.type != ChatType.PRIVATE or not message.document:
         return
-    if not message.document:
+    if not is_owner(user.id):
+        await handle_submission(update, context)
         return
     if not message.caption:
         await message.reply_text(
@@ -189,7 +339,6 @@ async def list_books_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grade = detect_grade(title)
         grouped.setdefault(grade, []).append((book_id, title))
 
-    # ترتيب المجموعات: أولى، تانية، تالتة، وأخيرًا غير المصنّف
     order = [
         "أولى ثانوي",
         "تانية ثانوي (مش بكالوريا)",
@@ -211,11 +360,15 @@ async def list_books_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if grade in grouped:
             lines = "\n".join(f"{bid}. {t}" for bid, t in grouped[grade])
             sections.append(f"{icons[grade]} {grade}\n{'-' * 20}\n{lines}")
+    # باقي المراحل (ابتدائي/إعدادي) اللي مش في الترتيب الثابت فوق
+    for grade, items in grouped.items():
+        if grade not in order:
+            lines = "\n".join(f"{bid}. {t}" for bid, t in items)
+            sections.append(f"📘 {grade}\n{'-' * 20}\n{lines}")
 
     # ملحوظة: عمدًا من غير parse_mode (Markdown) عشان عناوين الكتب ممكن
     # يكون فيها رموز زي _ أو * بتكسر التنسيق وتخلي الرسالة تفشل بالكامل
     text = "📚 قائمة الكتب:\n\n" + "\n\n".join(sections)
-    # تليجرام بيحدد أقصى طول للرسالة (4096 حرف)، لو القائمة كبيرة قوي نقسمها
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i + 4000])
 
@@ -237,99 +390,33 @@ async def delete_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("مفيش كتاب بالرقم ده.")
 
 
-async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر تشخيصي للمالك بس: بيوري المسار الحقيقي لقاعدة البيانات جوه
-    الكونتينر، عشان نتأكد هل الـ Volume شغال فعلاً ولا لأ."""
-    if not is_owner(update.effective_user.id):
-        return
-
-    db_path_env = os.environ.get("DB_PATH", "(مش متظبط - بيستخدم books.db الافتراضي)")
-    abs_path = os.path.abspath(db.DB_PATH)
-    dir_path = os.path.dirname(abs_path) or "."
-    dir_exists = os.path.isdir(dir_path)
-    file_exists = os.path.isfile(abs_path)
-    file_size = os.path.getsize(abs_path) if file_exists else 0
-
-    dir_listing = ""
-    if dir_exists:
-        try:
-            entries = os.listdir(dir_path)
-            dir_listing = "\n".join(entries) if entries else "(فاضي)"
-        except Exception as exc:
-            dir_listing = f"(مقدرش أقرأ المجلد: {exc})"
-
-    books_count = len(db.get_all_books())
-
-    text = (
-        "🔍 معلومات قاعدة البيانات:\n\n"
-        f"DB_PATH env var: {db_path_env}\n"
-        f"المسار الفعلي: {abs_path}\n"
-        f"المجلد ({dir_path}) موجود؟ {'✅ آه' if dir_exists else '❌ لأ'}\n"
-        f"محتويات المجلد:\n{dir_listing}\n\n"
-        f"ملف قاعدة البيانات موجود؟ {'✅ آه' if file_exists else '❌ لأ'}\n"
-        f"حجم الملف: {file_size} بايت\n"
-        f"عدد الكتب المتضافة حاليًا: {books_count}"
-    )
-    await update.message.reply_text(text)
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: بيوري عدد الكتب وعدد المستخدمين اللي كلموا البوت
-    في الخاص (اللي هيوصلهم أي /broadcast)."""
-    if not is_owner(update.effective_user.id):
-        return
-    books_count = len(db.get_all_books())
-    users_count = db.count_users()
-    await update.message.reply_text(
-        f"📊 إحصائيات:\n\n📚 عدد الكتب: {books_count}\n👤 عدد المستخدمين اللي كلموا البوت في الخاص: {users_count}"
-    )
-
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: /broadcast الرسالة اللي عايز تبعتها لكل اللي كلموا
-    البوت في الخاص قبل كده. لازم تحط نص بعد الأمر."""
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /search كلمة - بيدور يدوي في عناوين الكتب المتضافة."""
     if not is_owner(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("استخدم: /broadcast الرسالة اللي عايز تبعتها")
+        await update.message.reply_text("استخدم: /search كلمة أو جزء من اسم الكتاب")
         return
 
-    text = update.message.text.split(maxsplit=1)[1]
-    user_ids = db.get_all_user_ids()
-    if not user_ids:
-        await update.message.reply_text("مفيش أي مستخدم كلم البوت في الخاص لسه.")
+    keyword = " ".join(context.args)
+    books = db.get_all_books()
+    if not books:
+        await update.message.reply_text("لسه مفيش كتب متضافة.")
         return
 
-    sent, failed = 0, 0
-    for user_id in user_ids:
-        try:
-            await context.bot.send_message(chat_id=user_id, text=text)
-            sent += 1
-        except Exception:
-            # ممكن يكون المستخدم عمل بلوك للبوت أو حظره، متجاهلينه ومكملين
-            failed += 1
-
-    await update.message.reply_text(f"✅ اتبعتت لـ {sent} مستخدم. فشلت مع {failed}.")
-
-
-async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: بيبعتله ملف قاعدة البيانات (books.db) كنسخة احتياطية."""
-    if not is_owner(update.effective_user.id):
+    titles = [b[1] for b in books]
+    results = process.extract(keyword, titles, scorer=fuzz.WRatio, limit=10, score_cutoff=60)
+    if not results:
+        await update.message.reply_text("مفيش أي كتاب قريب من الكلمة دي.")
         return
-    if not os.path.isfile(db.DB_PATH):
-        await update.message.reply_text("ملف قاعدة البيانات مش موجود.")
-        return
-    await update.message.reply_document(
-        document=open(db.DB_PATH, "rb"),
-        filename=os.path.basename(db.DB_PATH),
-        caption="📦 نسخة احتياطية من قاعدة البيانات",
-    )
+
+    lines = [f"{books[idx][0]}. {books[idx][1]} ({int(score)}%)" for _, score, idx in results]
+    await update.message.reply_text("🔍 نتائج البحث:\n\n" + "\n".join(lines))
 
 
 async def find_duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: بيفحص كل الكتب المتضافة ويجمع اللي أسماءهم شبه
-    بعض قوي (بنفس نسبة التشابه المستخدمة وقت رفع كتاب جديد) في مجموعات،
-    عشان تقدر تكتشف كتب اتضافت مرتين بالغلط."""
+    بعض قوي في مجموعات، عشان تقدر تكتشف كتب اتضافت مرتين بالغلط."""
     if not is_owner(update.effective_user.id):
         return
 
@@ -366,17 +453,17 @@ async def find_duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append(f"  #{b[0]} - {b[1]}")
         lines.append("")
     text = "\n".join(lines)
-    # تليجرام بيحدد أقصى طول للرسالة (4096 حرف)، لو القائمة كبيرة قوي نقسمها
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i + 4000])
 
 
+# ---------- أوامر عامة وتشخيصية ----------
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً! أنا بوت مكتبة. لو انت المالك ابعتلي كتاب في الخاص مع اسمه في الكابشن.\n"
-        "وأي حد في الجروب يتكلم عن كتاب من الكتب المتضافة (بأي صياغة)، "
-        "هبعتهوله تلقائي لو لقيت تطابق كويس."
-    )
+    text = HELP_TEXT
+    if is_owner(update.effective_user.id):
+        text += "\n\n👑 وانت المالك: ابعت /help عشان تشوف كل الأوامر."
+    await update.message.reply_text(text)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,14 +478,17 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/delbook رقم - يمسح كتاب برقمه\n"
         "/search كلمة - يدور يدوي في الكتب باسم أو جزء منه\n"
         "/dupes - يفحص الكتب المتشابهة قوي (احتمال تكرار)\n\n"
+        "📥 طلبات المستخدمين\n"
+        "/subs - يعرض كل طلبات إضافة الكتب المعلّقة\n"
+        "/accept رقم [اسم بديل] - يقبل طلب ويضيف الكتاب\n"
+        "/reject رقم [سبب] - يرفض طلب\n"
+        "/reply رقم نص الرد - يرد على شخص سأل عن كتاب مش موجود\n\n"
         "📊 الإحصائيات\n"
         "/stats - عدد الكتب والمستخدمين\n"
         "/requests - إجمالي عدد طلبات البحث من الأول (لقت/ملقتش)\n"
         "/today - طلبات البحث النهاردة بس\n\n"
         "📢 التواصل\n"
-        "/broadcast رسالتك - يبعت رسالة لكل اللي كلموا البوت في الخاص\n"
-        "/cancel - يلغي وضع \"انتظار الرد\" لو دخلت فيه غلط بعد ما دوست\n"
-        "زرار \"رد على الشخص ده\"\n\n"
+        "/broadcast رسالتك - يبعت رسالة لكل اللي كلموا البوت في الخاص\n\n"
         "🔧 تشخيص\n"
         "/dbinfo - معلومات عن قاعدة البيانات ومكانها\n"
         "/backup - يبعتلك نسخة احتياطية من قاعدة البيانات"
@@ -406,47 +496,53 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: بيلغي وضع "انتظار الرد" لو دوس زرار "رد على الشخص
-    ده" بالغلط أو غيّر رأيه."""
+async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر تشخيصي للمالك بس: بيوري المسار الحقيقي لقاعدة البيانات جوه
+    الكونتينر، عشان نتأكد هل الـ Volume شغال فعلاً ولا لأ."""
     if not is_owner(update.effective_user.id):
         return
-    awaiting = context.bot_data.get("awaiting_reply", {})
-    if awaiting.pop(update.effective_user.id, None):
-        await update.message.reply_text("✅ تم إلغاء وضع الرد.")
-    else:
-        await update.message.reply_text("مفيش وضع رد نشط دلوقتي أصلاً.")
+
+    db_path_env = os.environ.get("DB_PATH", "(مش متظبط - بيستخدم books.db الافتراضي)")
+    abs_path = os.path.abspath(db.DB_PATH)
+    dir_path = os.path.dirname(abs_path) or "."
+    dir_exists = os.path.isdir(dir_path)
+    file_exists = os.path.isfile(abs_path)
+    file_size = os.path.getsize(abs_path) if file_exists else 0
+
+    dir_listing = ""
+    if dir_exists:
+        try:
+            entries = os.listdir(dir_path)
+            dir_listing = "\n".join(entries) if entries else "(فاضي)"
+        except Exception as exc:
+            dir_listing = f"(مقدرش أقرأ المجلد: {exc})"
+
+    books_count = len(db.get_all_books())
+    text = (
+        "🔍 معلومات قاعدة البيانات:\n\n"
+        f"DB_PATH env var: {db_path_env}\n"
+        f"المسار الفعلي: {abs_path}\n"
+        f"المجلد ({dir_path}) موجود؟ {'✅ آه' if dir_exists else '❌ لأ'}\n"
+        f"محتويات المجلد:\n{dir_listing}\n\n"
+        f"ملف قاعدة البيانات موجود؟ {'✅ آه' if file_exists else '❌ لأ'}\n"
+        f"حجم الملف: {file_size} بايت\n"
+        f"عدد الكتب المتضافة حاليًا: {books_count}"
+    )
+    await update.message.reply_text(text)
 
 
-async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: /search كلمة - بيدور يدوي في عناوين الكتب المتضافة
-    (زي البحث اللي بيحصل تلقائي في الجروب، بس بيدوسه المالك بنفسه)، مفيد
-    عشان تلاقي رقم كتاب من غير ما تفتح /listbooks كامل."""
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
-    if not context.args:
-        await update.message.reply_text("استخدم: /search كلمة أو جزء من اسم الكتاب")
-        return
-
-    keyword = " ".join(context.args)
-    books = db.get_all_books()
-    if not books:
-        await update.message.reply_text("لسه مفيش كتب متضافة.")
-        return
-
-    titles = [b[1] for b in books]
-    results = process.extract(keyword, titles, scorer=fuzz.WRatio, limit=10, score_cutoff=60)
-    if not results:
-        await update.message.reply_text("مفيش أي كتاب قريب من الكلمة دي.")
-        return
-
-    lines = [f"{books[idx][0]}. {books[idx][1]} ({int(score)}%)" for _, score, idx in results]
-    await update.message.reply_text("🔍 نتائج البحث:\n\n" + "\n".join(lines))
+    books_count = len(db.get_all_books())
+    users_count = db.count_users()
+    await update.message.reply_text(
+        f"📊 إحصائيات:\n\n📚 عدد الكتب: {books_count}\n"
+        f"👤 عدد المستخدمين اللي كلموا البوت في الخاص: {users_count}"
+    )
 
 
 async def requests_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: إجمالي عدد طلبات البحث اللي وصلت للبوت من أول ما
-    اشتغل - كام لقى تطابق وكام ملقاش."""
     if not is_owner(update.effective_user.id):
         return
     total, matched, not_matched = db.count_requests()
@@ -459,7 +555,6 @@ async def requests_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def today_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: نفس /requests بس للطلبات اللي حصلت النهاردة بس."""
     if not is_owner(update.effective_user.id):
         return
     total, matched, not_matched = db.count_requests_today()
@@ -471,15 +566,53 @@ async def today_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- المطابقة الذكية في الجروب وفي الخاص (بدون كلمة تريجر ثابتة) ----------
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /broadcast الرسالة اللي عايز تبعتها")
+        return
+
+    text = update.message.text.split(maxsplit=1)[1]
+    user_ids = db.get_all_user_ids()
+    if not user_ids:
+        await update.message.reply_text("مفيش أي مستخدم كلم البوت في الخاص لسه.")
+        return
+
+    sent, failed = 0, 0
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"✅ اتبعتت لـ {sent} مستخدم. فشلت مع {failed}.")
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    if not os.path.isfile(db.DB_PATH):
+        await update.message.reply_text("ملف قاعدة البيانات مش موجود.")
+        return
+    await update.message.reply_document(
+        document=open(db.DB_PATH, "rb"),
+        filename=os.path.basename(db.DB_PATH),
+        caption="📦 نسخة احتياطية من قاعدة البيانات",
+    )
+
+
+# ---------- الرد على شخص سأل عن كتاب مش موجود (بأمر /reply بس) ----------
 
 async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
-    """بترد على الشخص إن الكتاب مش متوفر حاليًا، وتبلغ المالك بالطلب ده
-    عشان يعرف الكتب المطلوبة اللي لسه مضافاهاش، ومعاها زرار "رد على
-    الشخص ده" عشان المالك يقدر يرد عليه مباشرة من غير ما يعرف الشات
-    بتاعه بنفسه. مبنبلغش المالك لو هو نفسه اللي بيدور (زي لما يجرب يبحث
-    بنفسه)."""
-    await update.message.reply_text("😔 الكتاب ده مش متوفر حاليًا.")
+    """بترد على الشخص إن الكتاب مش متوفر، وتسجل الطلب في السجل، وتبلغ
+    المالك بيه مع رقم يقدر يرد بيه بأمر /reply. مبنبلغش المالك لو هو نفسه
+    اللي بيدور (زي لما يجرب يبحث بنفسه)."""
+    await update.message.reply_text(
+        "😔 الكتاب ده مش متوفر حاليًا.\n"
+        "📥 لو معاك نسخة منه، ابعتهالي في الخاص كملف مع اسمه في الكابشن وهتتراجع من الإدارة."
+    )
     db.log_request(matched=False)
 
     user = update.effective_user
@@ -488,20 +621,12 @@ async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, q
 
     chat = update.effective_chat
     chat_label = "الخاص" if chat.type == ChatType.PRIVATE else (chat.title or "جروب")
-    username = f"@{user.username}" if user.username else user.full_name
+    username = _user_label(user)
 
-    # بنخزن مكان الرسالة الأصلية (الشات ورقم الرسالة) عشان لو المالك دوس
-    # على زرار الرد، نقدر نبعت رده كـ reply على نفس الرسالة دي في نفس
-    # الشات (سواء جروب أو خاص)، من غير ما يحتاج يعرف حاجة تانية.
-    key = f"{chat.id}_{update.message.message_id}"
-    context.bot_data.setdefault("pending_reply_targets", {})[key] = {
-        "chat_id": chat.id,
-        "message_id": update.message.message_id,
-        "user_label": username,
-    }
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ رد على الشخص ده", callback_data=f"replyto:{key}")],
-    ])
+    reply_id = db.add_pending_reply(
+        chat_id=chat.id, message_id=update.message.message_id,
+        user_label=username, query_text=query_text,
+    )
     try:
         await context.bot.send_message(
             chat_id=OWNER_ID,
@@ -509,41 +634,42 @@ async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, q
                 "📩 حد سأل عن كتاب مش موجود عندك:\n\n"
                 f"من: {username}\n"
                 f"مكان الرسالة: {chat_label}\n"
-                f"النص: {query_text}"
+                f"النص: {query_text}\n\n"
+                f"عشان ترد عليه: /reply {reply_id} نص ردك"
             ),
-            reply_markup=keyboard,
         )
     except Exception:
         logger.exception("فشل إرسال تنبيه للمالك عن كتاب مش متوفر")
 
 
-async def reply_target_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بيتنفذ لما المالك يدوس زرار "رد على الشخص ده" تحت تنبيه كتاب مش
-    متوفر. بيحط المالك في وضع "انتظار رد": أول رسالة نصية يبعتها في
-    الخاص بعد كده تتبعت تلقائي للشخص اللي سأل (كـ reply على رسالته
-    الأصلية)، بدل ما تتفحص كطلب كتاب عادي."""
-    query = update.callback_query
-    await query.answer()
-    if not is_owner(query.from_user.id):
+async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /reply رقم نص الرد - بيبعت نص الرد للشخص اللي سأل
+    عن كتاب مش موجود، كـ reply على رسالته الأصلية في نفس الشات بتاعه."""
+    if not is_owner(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("استخدم: /reply رقم نص الرد")
+        return
+    try:
+        reply_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("رقم الطلب لازم يكون رقم.")
         return
 
-    _, _, key = query.data.partition(":")
-    pending = context.bot_data.get("pending_reply_targets", {})
-    target = pending.get(key)
-    if not target:
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="⏳ الطلب ده قديم أو اتعمل فيه رد قبل كده.",
-        )
+    target = db.get_pending_reply(reply_id)
+    if not target or target[5]:  # target[5] = resolved
+        await update.message.reply_text("⏳ الطلب ده مش موجود أو اترد عليه قبل كده.")
         return
 
-    context.bot_data.setdefault("awaiting_reply", {})[query.from_user.id] = target
-    await query.edit_message_reply_markup(reply_markup=None)
-    await context.bot.send_message(
-        chat_id=query.from_user.id,
-        text=f"✍️ تمام، ابعت دلوقتي رسالتك في الخاص هنا وهتتبعت لـ {target['user_label']}.",
-    )
+    text = update.message.text.split(maxsplit=2)[2]
+    _, chat_id, message_id, user_label, _query_text, _resolved = target
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=message_id)
+        db.resolve_pending_reply(reply_id)
+        await update.message.reply_text(f"✅ اتبعتت لـ {user_label}.")
+    except Exception:
+        logger.exception("فشل إرسال رد المالك للشخص")
+        await update.message.reply_text("❌ حصلت مشكلة وأنا بابعت الرد (ممكن يكون عمل بلوك للبوت).")
 
 
 async def notify_owner_success(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -557,7 +683,7 @@ async def notify_owner_success(update: Update, context: ContextTypes.DEFAULT_TYP
 
     chat = update.effective_chat
     chat_label = "الخاص" if chat.type == ChatType.PRIVATE else (chat.title or "جروب")
-    username = f"@{user.username}" if user.username else user.full_name
+    username = _user_label(user)
     titles = "\n".join(f"- {b[1]}" for b in matched_books)
     try:
         await context.bot.send_message(
@@ -574,6 +700,15 @@ async def notify_owner_success(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("فشل إرسال تنبيه للمالك عن كتاب اتبعت بنجاح")
 
 
+async def reply_not_a_book(update: Update):
+    """الرسالة مش طلب كتاب: في الجروب بنتجاهلها تمامًا. في الخاص بس بنرد
+    بتعليمات الاستخدام الثابتة (مفيش أي كتب ولا كلام من الـ AI)."""
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.message.reply_text(HELP_TEXT)
+
+
+# ---------- المطابقة الذكية في الجروب وفي الخاص (بدون كلمة تريجر ثابتة) ----------
+
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -582,44 +717,25 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if chat_type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE):
         return
 
-    user = update.effective_user
-
-    # لو المالك في وضع "انتظار رد" (دوس زرار "رد على الشخص ده" تحت تنبيه
-    # كتاب مش متوفر)، أول رسالة نصية يبعتها في الخاص بعد كده تتبعت
-    # تلقائي للشخص ده بدل ما تتفحص كطلب كتاب عادي.
-    if chat_type == ChatType.PRIVATE and is_owner(user.id):
-        awaiting = context.bot_data.get("awaiting_reply", {})
-        target = awaiting.pop(user.id, None)
-        if target:
-            try:
-                await context.bot.send_message(
-                    chat_id=target["chat_id"],
-                    text=message.text,
-                    reply_to_message_id=target["message_id"],
-                )
-                await message.reply_text(f"✅ اتبعتت لـ {target['user_label']}.")
-            except Exception:
-                logger.exception("فشل إرسال رد المالك للشخص")
-                await message.reply_text("❌ حصلت مشكلة وأنا بابعت الرد، جرب تاني.")
-            return
-
-    # لو حد كلم البوت في الخاص، بنسجله عشان نقدر نستخدم /broadcast بعدين
     if chat_type == ChatType.PRIVATE:
-        db.remember_user(user.id)
+        # لو حد كلم البوت في الخاص، بنسجله عشان نقدر نستخدم /broadcast بعدين
+        db.remember_user(update.effective_user.id)
 
     text = message.text.strip()
     if len(text) < MIN_MESSAGE_LENGTH:
         return
 
     books = db.get_all_books()
-    if not books:
+
+    # فلتر أولي رخيص: لو الرسالة مفيهاش أي علامة إنها طلب كتاب (كلمة كتاب/
+    # طلب، مرحلة/مادة، أو شبه اسم كتاب عندنا) مبنكلمش الـ AI ولا بنرد.
+    if not might_be_book_request(text, books):
+        await reply_not_a_book(update)
         return
 
     # فلترة أولى بالمرحلة الدراسية *والمادة* (لو واضحين في رسالة المستخدم)
-    # قبل ما نبعت أي حاجة للـ AI أصلاً - ده بيمنع تمامًا إن الموديل يرجع
-    # كتاب من مرحلة أو مادة مختلفة عن اللي المستخدم طلبها. الفلترة دي
-    # "متحفظة": لو مقدرناش نحدد المرحلة أو المادة من النص، مبنرفضش الكتاب
-    # على أساسها ونسيب القرار للـ AI.
+    # قبل ما نبعت أي حاجة للـ AI - ده بيمنع تمامًا إن الموديل يرجع كتاب من
+    # مرحلة أو مادة مختلفة عن اللي المستخدم طلبها.
     query_grade = detect_query_grade(text)
     query_subject = detect_subject(text)
     candidate_books = [
@@ -628,31 +744,32 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         and subject_matches(detect_subject(b[1]), query_subject)
     ]
 
-    # لو المستخدم حدد مرحلة أو مادة واضحة ومفيش أي كتاب يطابقها أصلاً،
-    # مفيش داعي نكلم الـ AI خالص - بس نبلغ الشخص والمالك إن الكتاب مش موجود.
-    if (query_grade is not None or query_subject is not None) and not candidate_books:
-        await notify_not_found(update, context, text)
-        return
-
-    # بنستخدم Groq API (مجاني بالكامل) عشان يحدد كل الكتب المطابقة بشرط إن
-    # المرحلة الدراسية والمادة الاتنين يتطابقوا مع الطلب. لو الشرط اتحقق،
-    # بيرجع كل الكتب المطابقة (كل الأجزاء)، مش كتاب واحد بس. لو الـ AI شغال
-    # ورد بقائمة فاضية، ده رد شرعي (مفيش تطابق كافي) وبنسيبه كده. لو الـ AI
-    # فشل يشتغل أصلاً (مفتاح مفقود، مشكلة نت..)، بننزل على مطابقة نصية
-    # احتياطية (rapidfuzz) بترجع أقرب كتاب واحد بس.
+    # الـ AI بيقرر الأول هل الرسالة طلب كتاب أصلاً (None = لأ)، وبعدين بيختار
+    # الكتب المطابقة من candidate_books بس (كلها من القاعدة، مفيش كتب متألّفة).
+    # الطلب بيتنفذ في thread عشان الاتصال بالـ API مايوقفش البوت كله.
     matched_books = []
     try:
-        book_ids = ai_pick_books(text, candidate_books)
-        matched_books = [b for b in candidate_books if b[0] in book_ids]
-    except AIMatchUnavailable:
+        book_ids = await asyncio.to_thread(ai_pick_books, text, candidate_books)
+    except AIMatchUnavailable as exc:
+        logger.warning("الـ AI مش متاح (%s) - هنستخدم المطابقة الاحتياطية", exc)
         titles = [b[1] for b in candidate_books]
-        result = process.extractOne(text, titles, scorer=fuzz.WRatio)
+        result = process.extractOne(
+            text, titles, scorer=fuzz.WRatio, processor=normalize_text
+        ) if titles else None
         if result:
             _, score, idx = result
             if score >= MATCH_THRESHOLD:
                 matched_books = [candidate_books[idx]]
+        # من غير الـ AI مش قادرين نتأكد إنها طلب كتاب، فمانبلغش "مش متوفر" ولا
+        # نبعت تنبيه للمالك غير لو فيها كلمة صريحة زي "كتاب"
+        if not matched_books and not has_book_word(text):
+            return
+    else:
+        if book_ids is None:
+            await reply_not_a_book(update)
+            return
+        matched_books = [b for b in candidate_books if b[0] in book_ids]
 
-    # لو مفيش تطابق منطقي، نبلغ الشخص إن الكتاب مش متوفر ونبلغ المالك بالطلب.
     if not matched_books:
         await notify_not_found(update, context, text)
         return
@@ -695,14 +812,16 @@ def main():
     app.add_handler(CommandHandler("requests", requests_stats_cmd))
     app.add_handler(CommandHandler("today", today_stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("dupes", find_duplicates_cmd))
-    app.add_handler(CallbackQueryHandler(duplicate_decision_cb, pattern="^dup_"))
-    app.add_handler(CallbackQueryHandler(reply_target_cb, pattern="^replyto:"))
+    app.add_handler(CommandHandler("subs", subs_cmd))
+    app.add_handler(CommandHandler("accept", accept_cmd))
+    app.add_handler(CommandHandler("reject", reject_cmd))
+    app.add_handler(CommandHandler("reply", reply_cmd))
     app.add_error_handler(error_handler)
 
-    # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن)
+    # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن).
+    # رفع ملف من أي حد تاني في الخاص = طلب إضافة كتاب للمراجعة.
     app.add_handler(
         MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_owner_upload)
     )

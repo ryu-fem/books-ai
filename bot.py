@@ -67,8 +67,26 @@ def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 
+def is_admin(user_id: int) -> bool:
+    """المالك أو أي مشرف (Mod) مضاف بأمر /addmod - نفس الصلاحيات في كل
+    حاجة إلا إضافة/حذف مشرفين تانيين اللي فضلت حصرية للمالك بس."""
+    return user_id == OWNER_ID or user_id in db.get_all_admin_ids()
+
+
 def _user_label(user) -> str:
     return f"@{user.username}" if user.username else user.full_name
+
+
+def format_size(num_bytes) -> str:
+    """بيحوّل حجم بالبايت لصيغة مقروءة زي "12.3 ميجا" أو "1.2 جيجا"."""
+    if not num_bytes:
+        return "حجم غير معروف"
+    size = float(num_bytes)
+    for unit in ("بايت", "كيلو", "ميجا", "جيجا"):
+        if size < 1024 or unit == "جيجا":
+            return f"{size:.1f} {unit}" if unit != "بايت" else f"{int(size)} {unit}"
+        size /= 1024
+    return f"{size:.1f} جيجا"
 
 
 # ---------- إضافة كتاب (فحص التكرار من غير ما نمنع الإضافة) ----------
@@ -76,7 +94,7 @@ def _user_label(user) -> str:
 def find_duplicate_book(title: str):
     """بيدور على كتاب موجود قبل كده باسم شبيه قوي (مش لازم متطابق حرفيًا)
     عشان نلفت نظر المالك لاحتمال التكرار. بيرجع (id, title, file_id,
-    file_name) لو لقى حاجة، أو None لو مفيش تشابه كافي."""
+    file_name, file_size) لو لقى حاجة، أو None لو مفيش تشابه كافي."""
     books = db.get_all_books()
     if not books:
         return None
@@ -90,19 +108,20 @@ def find_duplicate_book(title: str):
 
 
 async def handle_new_book(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                           title: str, file_id: str, file_name: str):
+                           title: str, file_id: str, file_name: str, file_size: int = None):
     """نقطة مركزية لإضافة أي كتاب جديد (سواء من /addbook أو رفع مباشر من
     المالك، أو /accept على طلب مستخدم). بنضيف الكتاب على طول، ولو لقينا
     كتاب شبيه قوي موجود قبل كده، بنحذّر المالك بس في نفس الرسالة (من غير
-    ما نمنع الإضافة أو نسأله بأزرار) - يقدر يمسح القديم بـ /delbook لو حابب."""
+    ما نمنع الإضافة أو نسأله بأزرار) - يقدر يمسح القديم بـ /delbook لو حابب.
+    التحذير بيوضح اسم وحجم الكتابين عشان يقدر يقارن بسهولة."""
     duplicate = find_duplicate_book(title)
-    book_id = db.add_book(title=title, file_id=file_id, file_name=file_name)
-    msg = f"✅ تمت إضافة الكتاب رقم {book_id}: {title}"
+    book_id = db.add_book(title=title, file_id=file_id, file_name=file_name, file_size=file_size)
+    msg = f"✅ تمت إضافة الكتاب رقم {book_id}: {title} ({format_size(file_size)})"
     if duplicate:
-        dup_id, dup_title = duplicate[0], duplicate[1]
+        dup_id, dup_title, _dup_fid, _dup_fname, dup_size = duplicate
         msg += (
             f"\n\n⚠️ ملحوظة: لقيت كتاب شبيه موجود قبل كده:\n"
-            f"#{dup_id} - {dup_title}\n"
+            f"#{dup_id} - {dup_title} ({format_size(dup_size)})\n"
             f"لو عايز تمسح القديم: /delbook {dup_id}"
         )
     await update.message.reply_text(msg)
@@ -115,9 +134,9 @@ async def handle_new_book(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 def _submission_summary(sub) -> str:
     """نص وصف الطلب. sub = صف من db.get_submission."""
-    sub_id, user_id, username, title, file_id, file_name, status = sub
+    sub_id, user_id, username, title, file_id, file_name, file_size, status = sub
     return (
-        f"#{sub_id} - {title}\n"
+        f"#{sub_id} - {title} ({format_size(file_size)})\n"
         f"من: {username} (ID: {user_id})\n"
         f"الملف: {file_name or '-'}\n"
         f"الحالة: {status}"
@@ -148,17 +167,22 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("من فضلك ابعت الملف تاني وحط اسم الكتاب في الكابشن.")
         return
 
-    sub_id = db.add_submission(user.id, _user_label(user), title, doc.file_id, doc.file_name)
+    sub_id = db.add_submission(
+        user.id, _user_label(user), title, doc.file_id, doc.file_name, doc.file_size
+    )
     similar = find_duplicate_book(title)
 
     owner_text = (
         f"📥 طلب إضافة كتاب #{sub_id}\n\n"
         f"📖 الاسم المقترح: {title}\n"
         f"👤 من: {_user_label(user)} (ID: {user.id})\n"
-        f"📎 الملف: {doc.file_name or '-'}"
+        f"📎 الملف: {doc.file_name or '-'} ({format_size(doc.file_size)})"
     )
     if similar:
-        owner_text += f"\n⚠️ شبيه بكتاب موجود: #{similar[0]} - {similar[1]}"
+        owner_text += (
+            f"\n⚠️ شبيه بكتاب موجود: #{similar[0]} - {similar[1]}"
+            f" ({format_size(similar[4])})"
+        )
     owner_text += (
         f"\n\n✅ للقبول: /accept {sub_id} [اسم بديل اختياري]"
         f"\n❌ للرفض: /reject {sub_id} [سبب اختياري]"
@@ -182,9 +206,9 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: /accept رقم_الطلب [اسم بديل اختياري]
+    """أمر للمالك أو أي مشرف: /accept رقم_الطلب [اسم بديل اختياري]
     لو معملتش اسم بديل، بيستخدم الاسم اللي المستخدم اقترحه."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("استخدم: /accept رقم_الطلب [اسم بديل اختياري]")
@@ -196,13 +220,13 @@ async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sub = db.get_submission(sub_id)
-    if not sub or sub[6] != "pending":
+    if not sub or sub[7] != "pending":
         await update.message.reply_text("⏳ الطلب ده مش موجود أو اتعالج قبل كده.")
         return
 
     override_name = " ".join(context.args[1:]).strip()
     name = (override_name or sub[3])[:MAX_TITLE_LENGTH]
-    book_id = db.add_book(title=name, file_id=sub[4], file_name=sub[5])
+    book_id = db.add_book(title=name, file_id=sub[4], file_name=sub[5], file_size=sub[6])
     db.resolve_submission(sub_id, "accepted")
 
     try:
@@ -222,8 +246,8 @@ async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: /reject رقم_الطلب [سبب اختياري]"""
-    if not is_owner(update.effective_user.id):
+    """أمر للمالك أو أي مشرف: /reject رقم_الطلب [سبب اختياري]"""
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("استخدم: /reject رقم_الطلب [سبب اختياري]")
@@ -235,7 +259,7 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sub = db.get_submission(sub_id)
-    if not sub or sub[6] != "pending":
+    if not sub or sub[7] != "pending":
         await update.message.reply_text("⏳ الطلب ده مش موجود أو اتعالج قبل كده.")
         return
 
@@ -260,7 +284,7 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def subs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: /subs - بيعرض كل طلبات إضافة الكتب المعلّقة."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     pending = db.get_pending_submissions()
     if not pending:
@@ -301,7 +325,7 @@ async def add_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await handle_new_book(update, context, title, doc.file_id, doc.file_name)
+    await handle_new_book(update, context, title, doc.file_id, doc.file_name, doc.file_size)
 
 
 async def handle_owner_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,7 +335,7 @@ async def handle_owner_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.message
     if update.effective_chat.type != ChatType.PRIVATE or not message.document:
         return
-    if not is_owner(user.id):
+    if not is_admin(user.id):
         await handle_submission(update, context)
         return
     if not message.caption:
@@ -322,11 +346,11 @@ async def handle_owner_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     title = message.caption.strip()
     await handle_new_book(update, context, title, message.document.file_id,
-                           message.document.file_name)
+                           message.document.file_name, message.document.file_size)
 
 
 async def list_books_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     books = db.get_all_books()
     if not books:
@@ -374,7 +398,7 @@ async def list_books_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delete_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("استخدم: /delbook رقم_الكتاب")
@@ -392,7 +416,7 @@ async def delete_book_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: /search كلمة - بيدور يدوي في عناوين الكتب المتضافة."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("استخدم: /search كلمة أو جزء من اسم الكتاب")
@@ -417,7 +441,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def find_duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: بيفحص كل الكتب المتضافة ويجمع اللي أسماءهم شبه
     بعض قوي في مجموعات، عشان تقدر تكتشف كتب اتضافت مرتين بالغلط."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
 
     books = db.get_all_books()
@@ -459,16 +483,69 @@ async def find_duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---------- أوامر عامة وتشخيصية ----------
 
+async def addmod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس (مش المشرفين): /addmod آيدي - يضيف مشرف جديد بنفس
+    صلاحيات المالك في كل الأوامر إلا إضافة/حذف مشرفين تانيين."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /addmod آيدي_المستخدم")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آيدي المستخدم لازم يكون رقم.")
+        return
+    db.add_admin(target_id)
+    await update.message.reply_text(f"✅ اتضاف كمشرف: {target_id}")
+    try:
+        await context.bot.send_message(
+            chat_id=target_id, text="🎉 اتضفت كمشرف على البوت. ابعت /help تشوف الأوامر."
+        )
+    except Exception:
+        pass
+
+
+async def delmod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك بس: /delmod آيدي - يشيل مشرف."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /delmod آيدي_المستخدم")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آيدي المستخدم لازم يكون رقم.")
+        return
+    if db.remove_admin(target_id):
+        await update.message.reply_text(f"🗑️ اتشال من المشرفين: {target_id}")
+    else:
+        await update.message.reply_text("مش موجود في قائمة المشرفين أصلاً.")
+
+
+async def mods_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر للمالك أو أي مشرف: /mods - يعرض قائمة المشرفين الحاليين."""
+    if not is_admin(update.effective_user.id):
+        return
+    admin_ids = db.get_all_admin_ids()
+    if not admin_ids:
+        await update.message.reply_text("مفيش مشرفين مضافين دلوقتي (المالك بس).")
+        return
+    lines = "\n".join(str(a) for a in admin_ids)
+    await update.message.reply_text(f"👥 المشرفين الحاليين:\n{lines}")
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر للمالك بس: بيجمع كل أوامر المالك في رسالة واحدة."""
-    if not is_owner(update.effective_user.id):
+    """أمر للمالك أو أي مشرف: بيجمع كل الأوامر في رسالة واحدة."""
+    if not is_admin(update.effective_user.id):
         return
     text = (
-        "🛠️ أوامر المالك:\n\n"
+        "🛠️ الأوامر:\n\n"
         "📚 الكتب\n"
         "/addbook اسم الكتاب - يضيف كتاب (رد على الملف بالأمر ده)\n"
         "/listbooks - يعرض كل الكتب مجمّعة بالمرحلة\n"
@@ -489,15 +566,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/msg آيدي رسالتك - يبعت رسالة لشخص واحد بس بالآيدي بتاعه\n\n"
         "🔧 تشخيص\n"
         "/dbinfo - معلومات عن قاعدة البيانات ومكانها\n"
-        "/backup - يبعتلك نسخة احتياطية من قاعدة البيانات"
+        "/backup - يبعتلك نسخة احتياطية من قاعدة البيانات\n\n"
+        "👥 المشرفين\n"
+        "/mods - يعرض قائمة المشرفين الحاليين"
     )
+    if is_owner(update.effective_user.id):
+        text += (
+            "\n\n👑 أوامر إضافية للمالك بس:\n"
+            "/addmod آيدي - يضيف مشرف جديد\n"
+            "/delmod آيدي - يشيل مشرف"
+        )
     await update.message.reply_text(text)
 
 
 async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر تشخيصي للمالك بس: بيوري المسار الحقيقي لقاعدة البيانات جوه
     الكونتينر، عشان نتأكد هل الـ Volume شغال فعلاً ولا لأ."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
 
     db_path_env = os.environ.get("DB_PATH", "(مش متظبط - بيستخدم books.db الافتراضي)")
@@ -530,7 +615,7 @@ async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     books_count = len(db.get_all_books())
     users_count = db.count_users()
@@ -541,7 +626,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def requests_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     total, matched, not_matched = db.count_requests()
     await update.message.reply_text(
@@ -553,7 +638,7 @@ async def requests_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def today_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     total, matched, not_matched = db.count_requests_today()
     await update.message.reply_text(
@@ -567,7 +652,7 @@ async def today_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: /broadcast الرسالة اللي عايز تبعتها لكل اللي كلموا
     البوت في الخاص قبل كده."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("استخدم: /broadcast الرسالة اللي عايز تبعتها")
@@ -594,7 +679,7 @@ async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: /msg آيدي_المستخدم نص الرسالة - بيبعت رسالة لشخص
     واحد بس بالآيدي بتاعه (تقدر تلاقي الآيدي في إشعارات الطلبات أو
     /subs). لو المستخدم عامل بلوك للبوت أو الآيدي غلط، هيوضحلك."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if len(context.args) < 2:
         await update.message.reply_text("استخدم: /msg آيدي_المستخدم نص الرسالة")
@@ -617,7 +702,7 @@ async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if not os.path.isfile(db.DB_PATH):
         await update.message.reply_text("ملف قاعدة البيانات مش موجود.")
@@ -672,7 +757,7 @@ async def notify_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE, q
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر للمالك بس: /reply رقم نص الرد - بيبعت نص الرد للشخص اللي سأل
     عن كتاب مش موجود، كـ reply على رسالته الأصلية في نفس الشات بتاعه."""
-    if not is_owner(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         return
     if len(context.args) < 2:
         await update.message.reply_text("استخدم: /reply رقم نص الرد")
@@ -846,6 +931,9 @@ def main():
     app.add_handler(CommandHandler("accept", accept_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
     app.add_handler(CommandHandler("reply", reply_cmd))
+    app.add_handler(CommandHandler("addmod", addmod_cmd))
+    app.add_handler(CommandHandler("delmod", delmod_cmd))
+    app.add_handler(CommandHandler("mods", mods_cmd))
     app.add_error_handler(error_handler)
 
     # رفع ملف من المالك في الخاص = إضافة كتاب تلقائي (لو فيه كابشن).

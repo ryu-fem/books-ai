@@ -16,7 +16,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 file_id TEXT NOT NULL,
-                file_name TEXT
+                file_name TEXT,
+                file_size INTEGER
             )
             """
         )
@@ -39,6 +40,7 @@ def init_db():
                 title TEXT NOT NULL,
                 file_id TEXT NOT NULL,
                 file_name TEXT,
+                file_size INTEGER,
                 status TEXT NOT NULL DEFAULT 'pending'
             )
             """
@@ -69,6 +71,24 @@ def init_db():
             )
             """
         )
+        # المشرفين (Mods): زي المالك بالظبط في كل الأوامر، إلا إضافة/حذف
+        # مشرفين تانيين اللي فضلت حصرية للمالك بس.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+            """
+        )
+        # ترقية قاعدة بيانات قديمة كانت اتعملت قبل إضافة عمود file_size -
+        # CREATE TABLE IF NOT EXISTS بيتجاهل الجدول لو موجود قبل كده، فلازم
+        # نضيف العمود يدوي. لو العمود موجود أصلاً، sqlite هيرمي خطأ بسيط
+        # بنتجاهله عادي.
+        for table in ("books", "submissions"):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN file_size INTEGER")
+            except sqlite3.OperationalError:
+                pass  # العمود موجود بالفعل
         conn.commit()
 
 
@@ -92,11 +112,11 @@ def count_users() -> int:
         return cur.fetchone()[0]
 
 
-def add_book(title: str, file_id: str, file_name: str = None) -> int:
+def add_book(title: str, file_id: str, file_name: str = None, file_size: int = None) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "INSERT INTO books (title, file_id, file_name) VALUES (?, ?, ?)",
-            (title.strip(), file_id, file_name),
+            "INSERT INTO books (title, file_id, file_name, file_size) VALUES (?, ?, ?, ?)",
+            (title.strip(), file_id, file_name, file_size),
         )
         conn.commit()
         return cur.lastrowid
@@ -111,14 +131,17 @@ def delete_book(book_id: int) -> bool:
 
 def get_all_books():
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute("SELECT id, title, file_id, file_name FROM books ORDER BY id")
+        cur = conn.execute(
+            "SELECT id, title, file_id, file_name, file_size FROM books ORDER BY id"
+        )
         return cur.fetchall()
 
 
 def get_book_by_id(book_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "SELECT id, title, file_id, file_name FROM books WHERE id = ?", (book_id,)
+            "SELECT id, title, file_id, file_name, file_size FROM books WHERE id = ?",
+            (book_id,),
         )
         return cur.fetchone()
 
@@ -126,22 +149,22 @@ def get_book_by_id(book_id: int):
 # ---------- طلبات إضافة الكتب (Submissions) ----------
 
 def add_submission(user_id: int, username: str, title: str, file_id: str,
-                    file_name: str = None) -> int:
+                    file_name: str = None, file_size: int = None) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "INSERT INTO submissions (user_id, username, title, file_id, file_name)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (user_id, username, title.strip(), file_id, file_name),
+            "INSERT INTO submissions (user_id, username, title, file_id, file_name, file_size)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, username, title.strip(), file_id, file_name, file_size),
         )
         conn.commit()
         return cur.lastrowid
 
 
 def get_submission(sub_id: int):
-    """بيرجع (id, user_id, username, title, file_id, file_name, status) أو None."""
+    """بيرجع (id, user_id, username, title, file_id, file_name, file_size, status) أو None."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "SELECT id, user_id, username, title, file_id, file_name, status"
+            "SELECT id, user_id, username, title, file_id, file_name, file_size, status"
             " FROM submissions WHERE id = ?",
             (sub_id,),
         )
@@ -151,7 +174,7 @@ def get_submission(sub_id: int):
 def get_pending_submissions():
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "SELECT id, user_id, username, title, file_id, file_name, status"
+            "SELECT id, user_id, username, title, file_id, file_name, file_size, status"
             " FROM submissions WHERE status = 'pending' ORDER BY id"
         )
         return cur.fetchall()
@@ -243,3 +266,24 @@ def resolve_pending_reply(reply_id: int) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+# ---------- المشرفين (Mods) ----------
+
+def add_admin(user_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+
+def remove_admin(user_id: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_all_admin_ids():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT user_id FROM admins")
+        return [row[0] for row in cur.fetchall()]
